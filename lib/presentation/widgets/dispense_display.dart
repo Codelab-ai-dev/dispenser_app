@@ -43,7 +43,7 @@ class DispenseDisplay extends StatelessWidget {
               Text(
                 "${litros.toStringAsFixed(2)} L",
                 style: const TextStyle(
-                  fontSize: 200,
+                  fontSize: 150,
                   fontWeight: FontWeight.bold,
                   color: Colors.blue,
                 ),

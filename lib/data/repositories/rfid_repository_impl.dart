@@ -71,6 +71,18 @@ class RfidRepositoryImpl implements RfidRepository {
   Future<bool> isTagValid(String hexCode) async {
     final tags = await getAllTags();
     return tags.any((tag) => 
-      tag.hexCode.toLowerCase() == hexCode.toLowerCase() && tag.isActive);
+      tag.hexCode.toLowerCase().contains(hexCode.toLowerCase()) && tag.isActive);
+  }
+  
+  @override
+  Future<RfidTag?> getFullTagByPartialId(String partialHexCode) async {
+    final tags = await getAllTags();
+    try {
+      return tags.firstWhere(
+        (tag) => tag.hexCode.toLowerCase().contains(partialHexCode.toLowerCase()) && tag.isActive
+      );
+    } catch (e) {
+      return null;
+    }
   }
 }

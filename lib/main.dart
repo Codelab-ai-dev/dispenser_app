@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_application_2/presentation/pages/settings_page.dart';
 import 'package:go_router/go_router.dart';
 import 'presentation/pages/home_page.dart';
 import 'presentation/pages/history_page.dart';
+import 'presentation/pages/preset_page.dart';
 
 void main() {
   runApp(const MyApp());
@@ -20,6 +22,15 @@ final GoRouter _router = GoRouter(
       path: '/history',
       name: 'history',
       builder: (context, state) => const HistoryPage(),
+    ),
+    GoRoute(
+      path: '/preset',
+      name: 'preset',
+      builder: (context, state) => const PresetPage(),
+    ),
+    GoRoute(
+      path: '/settings',
+      builder: (context, state) => const SettingsPage(), // Nueva ruta para configuración
     ),
   ],
 );

@@ -6,27 +6,27 @@ import '../../data/models/dispense_record.dart';
 import '../../data/repositories/dispense_repository_impl.dart';
 import '../../domain/usecases/get_history_usecase.dart';
 import '../../domain/usecases/save_record_usecase.dart';
-import '../../domain/usecases/clear_history_usecase.dart';
 import '../../domain/usecases/validate_tag_usecase.dart';
+import '../../domain/usecases/get_full_tag_by_partial_id_usecase.dart';
 import '../pages/rfid_management_page.dart';
 import '../widgets/device_list.dart';
 import '../widgets/dispense_display.dart';
 import 'package:go_router/go_router.dart';
 
 class HomePage extends StatefulWidget {
-  const HomePage({Key? key}) : super(key: key);
+  const HomePage({super.key});
 
   @override
   State<HomePage> createState() => _HomePageState();
 }
 
 class _HomePageState extends State<HomePage> {
-  final BleService _bleService = BleService();
+  final BleService _bleService = BleService.instance;
   final DispenseRepositoryImpl _repository = DispenseRepositoryImpl();
   late GetHistoryUseCase _getHistoryUseCase;
   late SaveRecordUseCase _saveRecordUseCase;
-  late ClearHistoryUseCase _clearHistoryUseCase;
   late ValidateTagUseCase _validateTagUseCase;
+  late GetFullTagByPartialIdUseCase _getFullTagByPartialIdUseCase;
 
   List<DiscoveredDevice> devices = [];
   List<DispenseRecord> historial = [];
@@ -36,14 +36,17 @@ class _HomePageState extends State<HomePage> {
   bool _ignorarProximasLecturas = false;
   String? lastValidatedTagId; // Último tag RFID validado
   int lastRecordId = 0; // Último ID de registro usado
+  double? presetLitros; // Preset de litros configurado
+  bool presetActivo = false; // Indica si hay un preset activo
+  String rfidValidationMessage = 'Acerca un tag RFID para autorizar.'; // Mensaje de estado RFID
 
   @override
   void initState() {
     super.initState();
     _getHistoryUseCase = GetHistoryUseCase(_repository);
     _saveRecordUseCase = SaveRecordUseCase(_repository);
-    _clearHistoryUseCase = ClearHistoryUseCase(_repository);
     _validateTagUseCase = ValidateTagUseCase();
+    _getFullTagByPartialIdUseCase = GetFullTagByPartialIdUseCase();
 
     _loadHistorial();
     _bleService.requestPermissions();
@@ -91,7 +94,7 @@ class _HomePageState extends State<HomePage> {
           }
         }
         lastRecordId = maxId;
-        print('🔢 Último ID de registro cargado: $lastRecordId');
+        // print('🔢 Último ID de registro cargado: $lastRecordId');
       }
     });
   }
@@ -107,356 +110,505 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
+  // Helper method to safely parse numeric values
+  double _parseNumeric(dynamic value) {
+    if (value == null) return 0.0;
+    if (value is num) {
+      if (value.isInfinite || value.isNaN) {
+        // print("⚠️ _parseNumeric: num isInfinite or isNaN: $value");
+        return 0.0;
+      }
+      return value.toDouble();
+    }
+    if (value is String) {
+      String cleanedValue = value.trim().toLowerCase();
+      if (cleanedValue == 'inf' || cleanedValue == 'infinity' || cleanedValue == '-inf' || cleanedValue == '-infinity' || cleanedValue == 'nan') {
+        // print("⚠️ _parseNumeric: String represents infinity or NaN: $value");
+        return 0.0; 
+      }
+      double? parsed = double.tryParse(cleanedValue);
+      if (parsed == null || parsed.isInfinite || parsed.isNaN) {
+        // print("⚠️ _parseNumeric: double.tryParse failed or result isInfinite/isNaN for: $cleanedValue (original: $value)");
+        return 0.0;
+      }
+      return parsed;
+    }
+    // print("⚠️ _parseNumeric: Unhandled type for value: $value, type: ${value.runtimeType}");
+    return 0.0;
+  }
+
+  // Helper method to robustly extract RFID UIDs
+  String? _extractUidRobustly(String rawData) {
+  print("[DEBUG HomePage] _extractUidRobustly received rawData: '$rawData'");
+    if (rawData.isEmpty) return null;
+    // Prioritize JSON-like structures first
+    final RegExp jsonUidRegex = RegExp(
+      r'"(?:uid|tag_id|rfid|rfid_tag|tagId|verify_uid|card_id|cardId)"\s*:\s*"([0-9A-Fa-f\s]+)"',
+      caseSensitive: false,
+    );
+    var match = jsonUidRegex.firstMatch(rawData);
+    if (match != null && match.groupCount >= 1) {
+      String? potentialUid = match.group(1)?.replaceAll(' ', '').toUpperCase();
+      // Basic validation for UID length (e.g., 4 to 20 hex characters)
+      if (potentialUid != null && potentialUid.isNotEmpty && potentialUid.length >= 4 && potentialUid.length <= 20) {
+        print("[DEBUG HomePage] _extractUidRobustly (JSON pattern) returning: '$potentialUid'");
+        return potentialUid;
+      }
+    }
+
+    // Broader regex for UIDs that might be prefixed or just hex strings
+    final RegExp generalUidRegex = RegExp(
+      r'(?:UID:|TAG:|ID:|RFID:)?\s*([0-9A-Fa-f]{2}(?:\s*[0-9A-Fa-f]{2}){1,9}|[0-9A-Fa-f]{4,20})(?![0-9A-Fa-f])',
+      caseSensitive: false,
+    );
+    match = generalUidRegex.firstMatch(rawData);
+    if (match != null && match.groupCount >= 1) {
+      String? potentialUid = match.group(1)?.replaceAll(RegExp(r'[^0-9A-Fa-f]'), '').toUpperCase(); 
+      if (potentialUid != null && potentialUid.isNotEmpty && potentialUid.length >= 4 && potentialUid.length <= 20) {
+        if (RegExp(r'^[0-9A-Fa-f]+$').hasMatch(potentialUid)) {
+            print("[DEBUG HomePage] _extractUidRobustly (General pattern) returning: '$potentialUid'");
+          return potentialUid;
+        }
+      }
+    }
+    
+    String trimmedData = rawData.trim();
+    if (RegExp(r'^[0-9A-Fa-f\s]+$').hasMatch(trimmedData)) { 
+        String potentialUid = trimmedData.replaceAll(' ', '').toUpperCase();
+        if (potentialUid.isNotEmpty && potentialUid.length >= 4 && potentialUid.length <= 20) {
+             print("[DEBUG HomePage] _extractUidRobustly (Simple hex fallback) returning: '$potentialUid'");
+          return potentialUid;
+        }
+    }
+
+    print("[DEBUG HomePage] _extractUidRobustly returning null for rawData: '$rawData'");
+  return null;
+  }
+
   void connectToDevice(DiscoveredDevice device) async {
     final connected = await _bleService.connectToDevice(device);
 
     if (connected) {
       setState(() {});
 
-      // Buffer para acumular fragmentos de mensajes
-      String messageBuffer = '';
-
       _bleService.subscribeToCharacteristic().listen((data) {
         final jsonString = String.fromCharCodes(data);
         print("🔵 BLE recibido: $jsonString");
-
-        // Caso 1: Capturar fragmento inicial (contiene verify_uid pero no tiene llave de cierre)
-        if (jsonString.contains("verify_uid") && !jsonString.endsWith("}")) {
-          messageBuffer = jsonString;
-          print("🔗 Guardando fragmento inicial: $messageBuffer");
+        
+        // Procesar mensajes de reset_success para confirmar reset
+        if (jsonString.contains('"message":"reset_success"') || 
+            jsonString.contains('"reset_counter":true') || 
+            jsonString.contains('"force_reset":true') || 
+            jsonString.contains('"verify_reset":true')) {
+          print("Recibido mensaje de reset, confirmando reset");
+          if (mounted) {
+            setState(() {
+              _ignorarProximasLecturas = false;
+              litros = 0.0;
+              flujo = 0.0;
+              receivedData = "L: 0.00, F: 0.00";
+            });
+          }
+        }
+        
+        // Si estamos ignorando lecturas, no procesar datos de litros/flujo
+        if (_ignorarProximasLecturas) {
+          print("Ignorando actualización de litros/flujo debido a _ignorarProximasLecturas=true");
+          return;
+        }
+        
+        // Extraer datos de litros y flujo usando expresiones regulares
+        // Esta es una solución más robusta para mensajes truncados
+        final litrosRegex = RegExp(r'"litros":([0-9.]+)');
+        final flujoRegex = RegExp(r'"flujo":([0-9.]+)');
+        
+        final litrosMatch = litrosRegex.firstMatch(jsonString);
+        final flujoMatch = flujoRegex.firstMatch(jsonString);
+        
+        if (litrosMatch != null) {
+          final litrosValue = double.tryParse(litrosMatch.group(1) ?? '0.0') ?? 0.0;
+          print("Litros encontrados: $litrosValue");
+          
+          // Actualizar UI con los litros encontrados
+          if (mounted) {
+            setState(() {
+              litros = litrosValue;
+              receivedData = "L: ${litros.toStringAsFixed(2)}";
+              
+              // Si también tenemos flujo, actualizar eso también
+              if (flujoMatch != null) {
+                flujo = double.tryParse(flujoMatch.group(1) ?? '0.0') ?? 0.0;
+                receivedData += ", F: ${flujo.toStringAsFixed(2)}";
+              }
+            });
+          }
+          
+          // Verificar si se alcanzó el preset
+          if (presetActivo && presetLitros != null && litros >= presetLitros!) {
+            _bleService.sendData('{"stop_dispense":true}');
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Preset de $presetLitros L alcanzado.')),
+              );
+            }
+            _guardarEnHistorial();
+            _cancelarPreset();
+          }
+          
+          return; // Procesamiento exitoso
+        }
+        
+        // Si no encontramos litros, intentamos procesar como JSON normal
+        dynamic jsonData;
+        try {
+          jsonData = jsonDecode(jsonString);
+          // JSON válido
+        } catch (e) {
+          // El JSON no es válido, intentar extraer UID directamente
+          String? uidFromFailedJson = _extractUidRobustly(jsonString); 
+          if (uidFromFailedJson != null) {
+            print("UID extraído de mensaje: $uidFromFailedJson");
+            _validateRfidTag(uidFromFailedJson);
+            return;
+          }
+          
+          // Si no podemos procesar el mensaje, simplemente lo ignoramos
           return;
         }
 
-        // Caso 2: Si recibimos un fragmento que parece ser continuación (tiene } pero no tiene {)
-        if (messageBuffer.isNotEmpty &&
-            jsonString.contains("}") &&
-            !jsonString.contains("{")) {
-          String completeMessage = messageBuffer + jsonString;
-          print("🕐 Mensaje completo reconstruido: $completeMessage");
+        // JSON decodificado exitosamente. Ahora jsonData es un Map<String, dynamic> o List.
+        if (jsonData is Map<String, dynamic>) {
+          // 1. Verificar mensajes de control específicos que vienen como JSON
+          if (jsonData.containsKey('message')) {
+            final message = jsonData['message'];
+            if (message == 'RFID_validated') {
+              // print("✅ Mensaje de validación RFID recibido y procesado.");
+              if (mounted) {
+                setState(() {
+                  receivedData = "Tag RFID Validado"; 
+                  rfidValidationMessage = 'Tag RFID validado. Puede dispensar.';
+                });
+              }
+              return; 
+            } else if (message == 'RFID_invalid') {
+              // print("❌ Mensaje de RFID inválido recibido.");
+              if (mounted) {
+                setState(() {
+                  rfidValidationMessage = 'Tag RFID no reconocido o inválido.';
+                });
+              }
+              return; 
+            } else if (message == 'reset_success') {
+              // print("🔄 Reset del contador confirmado por ESP32.");
+              if (mounted) {
+                setState(() {
+                  litros = 0.0;
+                  flujo = 0.0;
+                  receivedData = 'Contador reseteado en ESP32.';
+                  rfidValidationMessage = 'Contador reseteado. Acerque tag para nueva autorización.';
+                  lastValidatedTagId = null; 
+                });
+              }
+              _ignorarProximasLecturas = false; 
+              return; 
+            }
+          }
 
-          // Intentar extraer el UID
-          RegExp uidRegex = RegExp(r'"verify_uid"\s*:\s*"([0-9a-fA-F]+)"');
-          Match? match = uidRegex.firstMatch(completeMessage);
+          // 2. Verificar mensajes de calibración
+          if (jsonData.containsKey('calibration_complete') && jsonData['calibration_complete'] == true) {
+            final newPpl = jsonData['new_ppl'];
+            _bleService.reportCalibrationSuccess(newPpl is int ? newPpl : (newPpl as num?)?.toInt() ?? 0);
+            // print('🎉 Calibración automática completada. Nuevo PPL: $newPpl');
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Calibración automática exitosa. Nuevo PPL: $newPpl')),
+              );
+            }
+            _saveAutoCalibrationRecord(newPpl?.toDouble() ?? 0.0);
+            return; 
+          } else if (jsonData.containsKey('calibration_failed')) {
+            final errorMsg = jsonData['error'] ?? 'Error desconocido.';
+            _bleService.reportCalibrationFailure(errorMsg);
+            // print('💀 Error en calibración automática desde ESP32: $errorMsg');
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Error en calibración desde ESP32: $errorMsg'), backgroundColor: Colors.red),
+              );
+            }
+            return; 
+          }
 
-          if (match != null && match.groupCount >= 1) {
-            String uid = match.group(1)!;
-            print("🏷️ UID extraído: $uid");
-            _validateRfidTag(uid);
-            messageBuffer = '';
-            return;
-          } else {
-            // Si no podemos extraer con regex, buscar cualquier secuencia hexadecimal
-            RegExp hexRegex = RegExp(r'[0-9a-fA-F]{8,}');
-            Match? hexMatch = hexRegex.firstMatch(completeMessage);
+          // 3. Verificar si el JSON contiene un UID para validar
+          String? uidFromVerifiedJson;
+          if (jsonData.containsKey('verify_uid') && jsonData['verify_uid'] is String) {
+            uidFromVerifiedJson = jsonData['verify_uid'];
+          } else if (jsonData.containsKey('tag_id') && jsonData['tag_id'] is String) {
+            uidFromVerifiedJson = jsonData['tag_id'];
+          } else if (jsonData.containsKey('uid') && jsonData['uid'] is String) {
+            uidFromVerifiedJson = jsonData['uid'];
+          }
 
-            if (hexMatch != null) {
-              String uid = hexMatch.group(0)!;
-              print("🔧 UID extraído por patrón hexadecimal: $uid");
-              _validateRfidTag(uid);
-              messageBuffer = '';
+          if (uidFromVerifiedJson != null) {
+            // print("🔑 UID extraído de JSON verificado: $uidFromVerifiedJson");
+            _validateRfidTag(uidFromVerifiedJson);
+            return; // Mensaje RFID procesado
+          }
+
+          // 4. Procesar datos de dispensación (litros, flujo)
+          if (jsonData.containsKey('litros') && jsonData.containsKey('flujo')) {
+            if (_ignorarProximasLecturas) {
+              // print("🚫 Ignorando lectura post-reset para evitar doble guardado.");
+              if(mounted) setState(() => receivedData = "Ignorando: $jsonString");
               return;
             }
-          }
 
-          // Limpiar buffer si no pudimos extraer nada útil
-          messageBuffer = '';
-        }
+            double parsedLitros = _parseNumeric(jsonData['litros']);
+            double parsedFlujo = _parseNumeric(jsonData['flujo']);
 
-        // Si estamos ignorando lecturas después de un reset, solo actualizar el texto de datos recibidos
-        if (_ignorarProximasLecturas) {
-          setState(() {
-            receivedData = jsonString;
-          });
-          print("🚧 Ignorando datos post-reset: $jsonString");
-          return;
-        }
-
-        // Mostrar datos recibidos en UI para depuración
-        setState(() {
-          receivedData = jsonString;
-        });
-
-        // Intentar detectar cualquier tipo de solicitud de validación RFID
-        print("🔍 Analizando mensaje para validación RFID: $jsonString");
-
-        // Método 1: Verificar formato estándar (rfid_validation + tag_id)
-        RegExp rfidValidationRegex = RegExp(r'"rfid_validation"\s*:\s*true');
-        RegExp rfidTagRegex = RegExp(r'"tag_id"\s*:\s*"([0-9a-fA-F\s]+)"');
-
-        // Método 2: Verificar formato alternativo (verify_uid)
-        RegExp verifyUidRegex = RegExp(r'"verify_uid"');
-        RegExp uidValueRegex = RegExp(
-          r'"verify_uid"\s*:\s*"?([0-9a-fA-F\s]+)"?',
-        );
-
-        // Método 3: Verificar formato simplificado (uid)
-        RegExp simpleUidRegex = RegExp(r'"uid"\s*:\s*"?([0-9a-fA-F\s]+)"?');
-
-        // Método 4: Buscar cualquier secuencia hexadecimal que parezca un UID
-        RegExp hexSequenceRegex = RegExp(r'[0-9a-fA-F]{8,}');
-
-        String? tagId;
-
-        // Caso 1: Formato estándar
-        if (rfidValidationRegex.hasMatch(jsonString)) {
-          Match? tagMatch = rfidTagRegex.firstMatch(jsonString);
-          if (tagMatch != null && tagMatch.groupCount >= 1) {
-            tagId = tagMatch.group(1)?.trim();
-            print("🏷️ Detectado formato estándar - Tag ID: $tagId");
-          }
-        }
-
-        // Caso 2: Formato verify_uid
-        if (tagId == null && verifyUidRegex.hasMatch(jsonString)) {
-          Match? uidMatch = uidValueRegex.firstMatch(jsonString);
-          if (uidMatch != null && uidMatch.groupCount >= 1) {
-            tagId = uidMatch.group(1)?.trim();
-            print("🔑 Detectado formato verify_uid - UID: $tagId");
-          } else {
-            // Extracción manual si la regex falla
-            int startIndex = jsonString.indexOf('"verify_uid"');
-            if (startIndex >= 0) {
-              // Buscar el valor después de verify_uid
-              String restOfString = jsonString.substring(startIndex + 11);
-              // Buscar cualquier secuencia hexadecimal
-              Match? hexMatch = hexSequenceRegex.firstMatch(restOfString);
-              if (hexMatch != null) {
-                tagId = hexMatch.group(0)?.trim();
-                print("💾 Extracción manual de verify_uid - UID: $tagId");
+            if (parsedLitros.isInfinite || parsedLitros.isNaN || parsedFlujo.isInfinite || parsedFlujo.isNaN) {
+              // print("🚫 Valores infinitos o NaN en JSON: L=${jsonData['litros']}, F=${jsonData['flujo']}. Original: $jsonString");
+              if (mounted) {
+                setState(() {
+                  litros = 0.0;
+                  flujo = 0.0;
+                  receivedData = "Error: Datos numéricos inválidos del sensor.";
+                });
               }
+              return;
             }
-          }
-        }
 
-        // Caso 3: Formato simple uid
-        if (tagId == null) {
-          Match? simpleMatch = simpleUidRegex.firstMatch(jsonString);
-          if (simpleMatch != null && simpleMatch.groupCount >= 1) {
-            tagId = simpleMatch.group(1)?.trim();
-            print("💼 Detectado formato simple uid - UID: $tagId");
-          }
-        }
+            if (mounted) {
+              setState(() {
+                litros = parsedLitros;
+                flujo = parsedFlujo;
+                receivedData = "L: ${litros.toStringAsFixed(2)}, F: ${flujo.toStringAsFixed(2)}";
+              });
+            }
 
-        // Caso 4: Último recurso - buscar cualquier secuencia hexadecimal
-        if (tagId == null) {
-          Match? hexMatch = hexSequenceRegex.firstMatch(jsonString);
-          if (hexMatch != null) {
-            tagId = hexMatch.group(0)?.trim();
-            print("🔧 Extracción de secuencia hexadecimal - UID: $tagId");
+            // Lógica de preset
+            if (presetActivo && presetLitros != null && litros >= presetLitros!) {
+              _bleService.sendData('{"stop_dispense":true}');
+              // print("🛑 Preset alcanzado ($presetLitros L), enviando comando de parada.");
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('Preset de $presetLitros L alcanzado.')),
+                );
+              }
+              _guardarEnHistorial(); 
+              _cancelarPreset(); 
+            }
+            return; // Datos de dispensación procesados
           }
-        }
+          
+          // Si el JSON es un Map pero no coincide con ninguna estructura conocida
+          // print("ℹ️ JSON (Map) recibido y decodificado, pero no coincide con formatos esperados: $jsonData");
+          if(mounted) setState(() => receivedData = "Datos desconocidos (Map): $jsonString");
 
-        // Si encontramos un ID válido, validarlo
-        if (tagId != null && tagId.isNotEmpty) {
-          print("🔎 Validando tag RFID: $tagId");
-          _validateRfidTag(tagId);
-          return;
         } else {
-          print("⛔ No se pudo extraer ningún UID válido de: $jsonString");
+          // Si el JSON decodificado no es un Map (podría ser una List u otro tipo primitivo)
+          // print("ℹ️ JSON decodificado no es un Map: $jsonData. Original: $jsonString");
+          if(mounted) setState(() => receivedData = "Formato inesperado (no Map): $jsonString");
         }
+      }); // End of _bleService.subscribeToCharacteristic().listen
+    } // End of if (connected)
+  } // End of connectToDevice method
 
-        // Extraer valores directamente con regex para actualización instantánea
-        RegExp litrosRegex = RegExp(r'"litros"\s*:\s*([0-9.]+)');
-        RegExp flujoRegex = RegExp(r'"flujo"\s*:\s*([0-9.]+)');
-
-        // Patrones para detectar diferentes tipos de confirmación de reset
-        RegExp resetConfirmRegex = RegExp(r'"reset_confirm"\s*:\s*true');
-        RegExp resetCounterConfirmRegex = RegExp(
-          r'"reset_counter_confirm"\s*:\s*true',
-        );
-        RegExp forceResetConfirmRegex = RegExp(
-          r'"force_reset_confirm"\s*:\s*true',
-        );
-        RegExp verifyResetConfirmRegex = RegExp(
-          r'"verify_reset_confirm"\s*:\s*true',
-        );
-        RegExp resetCompleteRegex = RegExp(r'"reset_complete"\s*:\s*true');
-
-        // Verificar si recibimos alguna confirmación de reset
-        if (resetConfirmRegex.hasMatch(jsonString) ||
-            resetCounterConfirmRegex.hasMatch(jsonString) ||
-            forceResetConfirmRegex.hasMatch(jsonString) ||
-            verifyResetConfirmRegex.hasMatch(jsonString) ||
-            resetCompleteRegex.hasMatch(jsonString)) {
-          print("🔄 Confirmación de reset recibida del ESP32: $jsonString");
-
-          // Forzar el valor de litros a cero nuevamente para asegurar
-          setState(() {
-            litros = 0.0;
-          });
-
-          return;
-        }
-
-        // Buscar valor de litros
-        Match? litrosMatch = litrosRegex.firstMatch(jsonString);
-        if (litrosMatch != null && litrosMatch.groupCount >= 1) {
-          String litrosStr = litrosMatch.group(1) ?? "0";
-          double? parsedLitros = double.tryParse(litrosStr);
-          if (parsedLitros != null) {
-            setState(() {
-              litros = parsedLitros;
-              receivedData = jsonString;
-            });
-            print("🟦 Litros por regex: $parsedLitros");
-          }
-        }
-
-        // Buscar valor de flujo
-        Match? flujoMatch = flujoRegex.firstMatch(jsonString);
-        if (flujoMatch != null && flujoMatch.groupCount >= 1) {
-          String flujoStr = flujoMatch.group(1) ?? "0";
-          double? parsedFlujo = double.tryParse(flujoStr);
-          if (parsedFlujo != null) {
-            setState(() {
-              flujo = parsedFlujo;
-            });
-            print("🟧 Flujo por regex: $parsedFlujo");
-          }
-        }
-
-        // También intentar el parseo JSON completo si es posible
-        if (jsonString.startsWith("{") && jsonString.endsWith("}")) {
-          try {
-            final decoded = jsonDecode(jsonString);
-            print("🟩 Decoded JSON: $decoded");
-            final parsedLitros =
-                double.tryParse(decoded['litros'].toString()) ?? 0.0;
-            final parsedFlujo =
-                double.tryParse(decoded['flujo'].toString()) ?? 0.0;
-            print("🟨 Litros JSON: $parsedLitros, Flujo JSON: $parsedFlujo");
-
-            setState(() {
-              litros = parsedLitros;
-              flujo = parsedFlujo;
-            });
-          } catch (e) {
-            print("❌ Error al parsear JSON válido: $e");
-          }
-        } else {
-          print("⚠️ Datos no están en formato JSON: $jsonString");
-        }
-      });
-    }
+  Future<void> _guardarEnHistorial() async {
+  // Primero detener la dispensación y resetear el contador
+  try {
+    // Enviar comando de reset que coincide con el código del ESP32
+    await _bleService.sendData('{"reset_counter":true}');
+    print("📤 Comando de reset enviado");
+    // Pequeña pausa para asegurar que el comando de reset se procese
+    await Future.delayed(const Duration(milliseconds: 500));
+  } catch (e) {
+    print("❌ Error al enviar comando de reset: $e");
   }
 
-  void _guardarEnHistorial() {
-    // Incrementar el ID para la nueva transacción
-    lastRecordId++;
+  // Incrementar el ID para la nueva transacción
+  lastRecordId++;
 
-    // Crear un registro incluyendo el tagId si está disponible
+  // Crear un registro incluyendo el tagId si está disponible
+  final record = DispenseRecord(
+    id: lastRecordId,
+    timestamp: DateTime.now(),
+    litros: litros,
+    flujo: flujo,
+    tagId: lastValidatedTagId, // Incluir el último tag validado
+    eventType: DispenseRecord.eventTypeDispense, // Especificar tipo de evento
+  );
+
+  _saveRecordUseCase.execute(record);
+
+  setState(() {
+    historial.add(record);
+    _ignorarProximasLecturas = true;
+    
+    // Limpiar el preset después de guardar
+    presetActivo = false;
+    presetLitros = null;
+    
+    // Resetear el contador a cero
+    litros = 0.0;
+    flujo = 0.0;
+    receivedData = "L: 0.00, F: 0.00";
+    
+    // Resetear el tag validado para solicitar uno nuevo
+    lastValidatedTagId = null;
+    rfidValidationMessage = 'Acerque un tag RFID para comenzar';
+  });
+  
+  // Después de un breve periodo, permitir nuevas lecturas
+  Future.delayed(const Duration(seconds: 1), () {
+    if (mounted) {
+      setState(() {
+        _ignorarProximasLecturas = false;
+        print("Habilitando nuevas lecturas después del reset");
+      });
+    }
+  });
+
+  // Ya enviamos el comando de reset, solo mostrar mensaje
+  if (mounted) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Registro guardado. Acerque un nuevo tag RFID para continuar.'),
+        backgroundColor: Colors.blue,
+      ),
+    );
+  }
+  }
+
+  Future<void> _saveAutoCalibrationRecord(double newPplValue) async {
+    // Aquí asumimos que 'newPplValue' es el valor que queremos registrar como 'litros'
+    // o alguna otra representación del resultado de la calibración.
+    // Si necesitamos los litros de referencia originales, se requeriría un manejo de estado más complejo
+    // para pasarlos desde SettingsPage hasta aquí.
+    lastRecordId++;
     final record = DispenseRecord(
       id: lastRecordId,
       timestamp: DateTime.now(),
-      litros: litros,
-      flujo: flujo,
-      tagId: lastValidatedTagId, // Incluir el último tag validado
+      litros: newPplValue, // Guardando el nuevo PPL en el campo litros como referencia
+      flujo: 0.0, 
+      eventType: DispenseRecord.eventTypeAutoCalibration,
+      tagId: null, // Opcional: se podría usar para el valor de litros de referencia si no es muy largo
     );
-
-    _saveRecordUseCase.execute(record);
-
-    setState(() {
-      historial.add(record);
-      _ignorarProximasLecturas = true;
-    });
-
-    // Reiniciar el contador después de guardar
-    _resetCounter(showMessage: 'Registro guardado y contador reiniciado');
+    await _saveRecordUseCase.execute(record);
+    // print('💾 Registro de calibración automática guardado: ${record.toJson()}');
+    _loadHistorial(); // Recargar para mostrar el nuevo registro
   }
 
-  // Método para reiniciar el contador sin guardar en historial
-  void _resetCounter({String? showMessage}) {
-    setState(() {
-      _ignorarProximasLecturas = true;
-    });
-
-    // Enviar comandos de reset al ESP32
-    try {
-      _bleService.sendData('{"reset_counter":true}');
-
-      Future.delayed(const Duration(milliseconds: 500), () {
-        _bleService.sendData('{"force_reset":true}');
-      });
-
-      Future.delayed(const Duration(milliseconds: 1000), () {
-        _bleService.sendData('{"verify_reset":true}');
-      });
-
-      // Establecer litros a 0 después de enviar los comandos
-      setState(() {
-        litros = 0.0;
-      });
-
-      Future.delayed(const Duration(seconds: 5), () {
-        if (mounted) {
-          setState(() {
-            _ignorarProximasLecturas = false;
-          });
-        }
-      });
-
-      // Mostrar mensaje si se proporciona
-      if (showMessage != null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(showMessage),
-            duration: const Duration(seconds: 2),
-          ),
-        );
-      } else {
+  Future<void> _resetCounter({String? showMessage}) async {
+    if (!_bleService.isConnected) {
+      if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text('Contador reiniciado'),
-            duration: Duration(seconds: 2),
+            content: Text('No conectado al dispositivo BLE para reiniciar.'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+      return;
+    }
+
+    if (lastValidatedTagId == null) {
+        if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+            content: Text('Se requiere autorización RFID para reiniciar el contador.'),
+            backgroundColor: Colors.orange,
+            ),
+        );
+        }
+        // print("ℹ️ Solicitando autorización RFID para resetear contador.");
+        return;
+    }
+
+    try {
+      await _bleService.sendData('{"reset_counter":true}');
+      // print("🔄 Comando de reset enviado al ESP32.");
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(showMessage ?? 'Comando de reinicio enviado al dispositivo.'),
+            backgroundColor: Colors.blue,
           ),
         );
       }
     } catch (e) {
-      print("❌ Error al enviar comandos de reset: $e");
-      setState(() {
-        _ignorarProximasLecturas = false;
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error al reiniciar: $e'),
-          backgroundColor: Colors.red,
-          duration: const Duration(seconds: 3),
-        ),
-      );
+      // print("❌ Error al enviar comando de reset: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error al reiniciar contador: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
     }
   }
 
-  void limpiarHistorial() async {
-    await _clearHistoryUseCase.execute();
-    setState(() {
-      historial.clear();
-    });
-  }
-
-  // Método para validar un tag RFID y enviar respuesta al ESP32
   Future<void> _validateRfidTag(String tagId) async {
-    try {
-      final isValid = await _validateTagUseCase.execute(tagId);
+    print("[DEBUG HomePage] _validateRfidTag received tagId: '$tagId'");
+    // Clean the tag ID by removing all non-hexadecimal characters (not just spaces)
+    final cleanTagId = tagId.replaceAll(RegExp(r'[^0-9a-fA-F]'), '');
+    print("[DEBUG HomePage] _validateRfidTag cleanTagId after replaceAll: '$cleanTagId'");
+    if (_ignorarProximasLecturas) {
+      // print("🚫 Validación de tag ignorada debido a _ignorarProximasLecturas = true");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Validación de tag ignorada temporalmente.'),
+            backgroundColor: Colors.grey,
+          ),
+        );
+      }
+      return;
+    }
 
-      // Guardar el tagId si es válido para incluirlo en el historial
+    // print("🔑 Validando tag RFID internamente: $cleanTagId");
+    if (mounted) {
+      setState(() {
+        rfidValidationMessage = 'Validando tag: ${cleanTagId.toUpperCase()}...';
+      });
+    }
+
+    try {
+      final isValid = await _validateTagUseCase.execute(cleanTagId);
+      // print("✅ Resultado de validación para $cleanTagId: $isValid");
+      
+      // Si el tag es válido, intentamos obtener el tag completo de la base de datos
+      String fullTagId = cleanTagId;
       if (isValid) {
+        final fullTag = await _getFullTagByPartialIdUseCase.execute(cleanTagId);
+        if (fullTag != null) {
+          fullTagId = fullTag.hexCode;
+          print("[DEBUG HomePage] Found full tag ID: '${fullTag.hexCode}' for partial ID: '$cleanTagId'");
+        }
+      }
+
+      if (mounted) {
         setState(() {
-          lastValidatedTagId = tagId;
+          if (isValid) {
+            lastValidatedTagId = fullTagId; // Guardar el ID completo
+            rfidValidationMessage = 'Tag RFID autorizado: ${fullTagId.toUpperCase()}';
+          } else {
+            rfidValidationMessage = 'Tag RFID NO autorizado: ${cleanTagId.toUpperCase()}';
+          }
         });
       }
 
-      // Enviar respuesta al ESP32
-      await _bleService.sendRfidValidationResponse(isValid, tagId);
+      // Enviar el ID completo al ESP32
+      await _bleService.sendRfidValidationResponse(isValid, fullTagId);
 
-      // Mostrar mensaje en la UI
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
               isValid
-                  ? 'Tag RFID validado correctamente: ${tagId.toUpperCase()}'
-                  : 'Tag RFID no autorizado: ${tagId.toUpperCase()}',
+                  ? 'Tag RFID validado: ${fullTagId.toUpperCase()}'
+                  : 'Tag RFID no autorizado: ${cleanTagId.toUpperCase()}',
             ),
             backgroundColor: isValid ? Colors.green : Colors.red,
             duration: const Duration(seconds: 2),
@@ -464,11 +616,26 @@ class _HomePageState extends State<HomePage> {
         );
       }
     } catch (e) {
-      print("❌ Error al validar tag RFID: $e");
-      // Enviar respuesta de error al ESP32
-      await _bleService.sendRfidValidationResponse(false, tagId);
+      // print("❌ Error al validar tag RFID: $e");
+      if (mounted) {
+        setState(() {
+          rfidValidationMessage = 'Error al validar tag: ${cleanTagId.toUpperCase()}';
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error validando tag: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+      try {
+        await _bleService.sendRfidValidationResponse(false, cleanTagId);
+      } catch (bleError) {
+        // print("❌ Error al enviar respuesta de validación RFID fallida: $bleError");
+      }
     }
   }
+
 
   // Navegar a la pantalla de gestión de tags RFID
   void _navigateToRfidManagement() {
@@ -480,6 +647,84 @@ class _HomePageState extends State<HomePage> {
   // Navegar a la página de historial
   void _navigateToHistory() {
     context.push('/history');
+  }
+  
+  // Navegar a la página de preset de litros
+  Future<void> _navigateToPreset() async {
+    // Mostrar la página de preset y esperar el resultado
+    final result = await context.push<double>('/preset');
+    
+    // Si el usuario seleccionó un preset válido
+    if (result != null && result > 0) {
+      setState(() {
+        presetLitros = result;
+        presetActivo = true;
+      });
+      
+      // Enviar el preset al ESP32
+      try {
+        await _bleService.sendPresetLitros(result);
+        
+        // Mostrar mensaje de confirmación
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Preset configurado: ${result.toStringAsFixed(2)} L'),
+              backgroundColor: Colors.green,
+              duration: const Duration(seconds: 2),
+            ),
+          );
+        }
+      } catch (e) {
+        // Mostrar error si no se pudo enviar el preset
+        if (mounted) {
+          setState(() {
+            presetActivo = false;
+            presetLitros = null;
+          });
+          
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Error al configurar preset: $e'),
+              backgroundColor: Colors.red,
+              duration: const Duration(seconds: 3),
+            ),
+          );
+        }
+      }
+    }
+  }
+  
+  // Cancelar el preset actual
+  Future<void> _cancelarPreset() async {
+    try {
+      await _bleService.cancelPreset();
+      
+      setState(() {
+        presetActivo = false;
+        presetLitros = null;
+      });
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Preset cancelado'),
+            backgroundColor: Colors.orange,
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error al cancelar preset: $e'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    }
   }
 
   @override
@@ -502,6 +747,18 @@ class _HomePageState extends State<HomePage> {
           ],
         ),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.history),
+            onPressed: _navigateToHistory,
+            tooltip: 'Historial de Dispensas',
+          ),
+          IconButton(
+            icon: const Icon(Icons.settings),
+            onPressed: () {
+              context.push('/settings');
+            },
+            tooltip: 'Configuración',
+          ),
           if (_bleService.isConnected)
             IconButton(
               icon: const Icon(Icons.save),
@@ -533,9 +790,9 @@ class _HomePageState extends State<HomePage> {
                     padding: const EdgeInsets.all(8),
                     margin: const EdgeInsets.symmetric(horizontal: 16),
                     decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.05),
+                      color: Colors.black.withAlpha(13),
                       borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Colors.blue.withOpacity(0.3)),
+                      border: Border.all(color: Colors.blue.withAlpha(77)),
                     ),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -562,21 +819,123 @@ class _HomePageState extends State<HomePage> {
                   ),
 
                   const SizedBox(height: 10),
-                  DispenseDisplay(litros: litros, flujo: flujo),
-                  const SizedBox(height: 20),
-                  ElevatedButton(
-                    onPressed: _guardarEnHistorial,
-                    style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 24,
-                        vertical: 12,
+                  
+                  // Mostrar información del preset si está activo
+                  if (presetActivo && presetLitros != null)
+                    Container(
+                      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.green.shade50,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.green.shade300),
+                      ),
+                      child: Column(
+                        children: [
+                          Row(
+                            children: [
+                              Icon(Icons.auto_awesome, color: Colors.green.shade700),
+                              const SizedBox(width: 8),
+                              Text(
+                                'Preset Activo: ${presetLitros!.toStringAsFixed(2)} L',
+                                style: TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  color: Colors.green.shade700,
+                                  fontSize: 16,
+                                ),
+                              ),
+                              const Spacer(),
+                              IconButton(
+                                icon: const Icon(Icons.cancel, color: Colors.red),
+                                onPressed: _cancelarPreset,
+                                tooltip: 'Cancelar preset',
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 4),
+                          LinearProgressIndicator(
+                            value: litros / (presetLitros ?? 1),
+                            backgroundColor: Colors.green.shade100,
+                            valueColor: AlwaysStoppedAnimation<Color>(Colors.green.shade700),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'Progreso: ${litros.toStringAsFixed(2)} / ${presetLitros!.toStringAsFixed(2)} L',
+                            style: TextStyle(color: Colors.green.shade700),
+                          ),
+                        ],
                       ),
                     ),
-                    child: const Text(
-                      "Guardar y Reiniciar Contador",
-                      style: TextStyle(fontSize: 16),
+                  
+                  DispenseDisplay(litros: litros, flujo: flujo),
+                  const SizedBox(height: 20),
+                  
+                  // Mostrar botones de acción condicionalmente
+                  if (lastValidatedTagId != null)
+                    // Si hay un RFID autorizado, mostrar botón de preset y guardar
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            onPressed: _navigateToPreset,
+                            icon: const Icon(Icons.water_drop),
+                            label: const Text('Configurar Preset'),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.blue,
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            onPressed: _guardarEnHistorial,
+                            icon: const Icon(Icons.save),
+                            label: const Text('Guardar y Reiniciar'),
+                            style: ElevatedButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                            ),
+                          ),
+                        ),
+                      ],
+                    )
+                  else
+                    // Si no hay RFID autorizado, mostrar mensaje y botón de guardar
+                    Column(
+                      children: [
+                        // Mensaje informativo sobre RFID
+                        Container(
+                          margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: Colors.orange.shade50,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.orange.shade300),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(Icons.nfc, color: Colors.orange.shade700),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  rfidValidationMessage, // Mostrar el mensaje de estado RFID dinámico
+                                  style: TextStyle(
+                                    color: Colors.orange.shade800,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                  textAlign: TextAlign.center,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        // Cuando no hay RFID autorizado, solo se muestra el mensaje.
+                        // El botón de guardar y reiniciar se omite por seguridad.
+                      ],
                     ),
-                  ),
+                  
                   const SizedBox(height: 16),
                   ElevatedButton.icon(
                     onPressed: _navigateToHistory,

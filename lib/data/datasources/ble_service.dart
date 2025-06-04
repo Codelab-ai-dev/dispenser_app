@@ -9,6 +9,10 @@ final charUuid = Uuid.parse("abcdef01-1234-5678-1234-56789abcdef0");
 final FlutterReactiveBle flutterReactiveBle = FlutterReactiveBle();
 
 class BleService {
+  // Singleton setup
+  static final BleService _instance = BleService._internal();
+  static BleService get instance => _instance;
+  BleService._internal(); // Private constructor
   // Variables de estado BLE
   DiscoveredDevice? _connectedDevice;
   QualifiedCharacteristic? _characteristic;
@@ -22,6 +26,7 @@ class BleService {
   // Controladores de Stream para comunicar eventos
   final _connectionStatusController = StreamController<bool>.broadcast();
   final _dataStreamController = StreamController<String>.broadcast();
+  final _calibrationStatusController = StreamController<Map<String, dynamic>>.broadcast();
   
   // Constantes BLE
 
@@ -29,6 +34,7 @@ class BleService {
   DiscoveredDevice? get connectedDevice => _connectedDevice;
   Stream<bool> get connectionStatusStream => _connectionStatusController.stream;
   Stream<String> get dataStream => _dataStreamController.stream;
+  Stream<Map<String, dynamic>> get calibrationStatusStream => _calibrationStatusController.stream;
 
   Future<void> requestPermissions() async {
     await Permission.location.request();
@@ -190,28 +196,97 @@ class BleService {
     }
   }
   
+  // Método para enviar el valor de Pulsos Por Litro (PPL) al ESP32
+  Future<void> sendPplValue(int ppl) async {
+    if (_characteristic == null) {
+      throw Exception('No conectado a ningún dispositivo o característica no disponible.');
+    }
+    final String command = '{"set_ppl":$ppl}';
+    print("📤 Enviando comando PPL: $command");
+    await sendData(command);
+    // Considerar un pequeño delay si es necesario para el ESP32 procesar
+    // await Future.delayed(const Duration(milliseconds: 100)); 
+  }
+
+  // --- Métodos para Calibración Automática ---
+  Future<void> startAutoCalibration(double litros) async {
+    if (_characteristic == null) throw Exception('Característica BLE no disponible.');
+    final command = '{"start_calibration":$litros}';
+    print('📤 Enviando comando Iniciar Calibración Automática: $command');
+    await sendData(command);
+  }
+
+  Future<void> confirmAutoCalibrationVolume() async {
+    if (_characteristic == null) throw Exception('Característica BLE no disponible.');
+    const command = '{"confirm_calibration_volume":true}';
+    print('📤 Enviando comando Confirmar Volumen Calibración: $command');
+    await sendData(command);
+  }
+
+  Future<void> cancelAutoCalibration() async {
+    if (_characteristic == null) throw Exception('Característica BLE no disponible.');
+    const command = '{"cancel_calibration":true}';
+    print('📤 Enviando comando Cancelar Calibración: $command');
+    await sendData(command);
+  }
+
   // Método para enviar respuesta de validación de RFID al ESP32
   Future<void> sendRfidValidationResponse(bool isValid, String tagId) async {
+    print("[DEBUG BleService] sendRfidValidationResponse received tagId: '$tagId'");
     // Asegurarse de que el UID esté completo (debe ser una cadena hexadecimal)
     final String cleanTagId = tagId.replaceAll(RegExp(r'[^0-9a-fA-F]'), '');
-    print("🔍 UID limpio: $cleanTagId");
+    print("[DEBUG BleService] sendRfidValidationResponse cleanTagId after replaceAll: '$cleanTagId'");
     
     try {
-      // Enviar primero un mensaje ultra corto para indicar validez
+      // Primero enviamos el mensaje de validación
       final validMessage = isValid ? '{"v":1}' : '{"v":0}';
-      print("📌 Enviando indicador de validez: $validMessage");
       await sendData(validMessage);
       await Future.delayed(const Duration(milliseconds: 100));
       
-      // Luego enviar el UID en un mensaje separado
-      final uidMessage = '{"u":"$cleanTagId"}'; 
-      print("🔑 Enviando UID: $uidMessage");
+      // Asegurarnos de enviar el UID completo, sin truncar
+      // Enviamos el UID exactamente como está en la base de datos
+      final uidMessage = '{"u":"$cleanTagId","full_uid":true}';
+      print("[DEBUG BleService] sendRfidValidationResponse uidMessage: '$uidMessage'");
       await sendData(uidMessage);
       await Future.delayed(const Duration(milliseconds: 100));
-      
-      print("✅ Respuesta RFID enviada en dos partes");
     } catch (e) {
       print("❌ Error al enviar respuesta RFID: $e");
+      throw e;
+    }
+  }
+  
+  /// Envía el preset de litros al ESP32
+  /// 
+  /// Este método envía un comando al ESP32 para configurar un límite
+  /// automático de despacho. Cuando se alcance esta cantidad de litros,
+  /// el ESP32 detendrá automáticamente el flujo.
+  Future<void> sendPresetLitros(double litros) async {
+    try {
+      // Redondear a 2 decimales para evitar problemas de precisión
+      final litrosRedondeados = litros.toStringAsFixed(2);
+      
+      // Crear el mensaje JSON con el preset
+      final presetMessage = '{"preset_litros":$litrosRedondeados}';
+      print("🎯 Enviando preset de litros: $litrosRedondeados L");
+      
+      // Enviar el comando al ESP32
+      await sendData(presetMessage);
+      
+      // Enviar un comando de confirmación después de un breve retraso
+      await Future.delayed(const Duration(milliseconds: 100));
+      await sendData('{"preset_confirm":true}');
+    } catch (e) {
+      print("❌ Error al enviar preset de litros: $e");
+      throw e;
+    }
+  }
+  
+  /// Cancela el preset actual y detiene el despacho
+  Future<void> cancelPreset() async {
+    try {
+      await sendData('{"cancel_preset":true}');
+    } catch (e) {
+      print("❌ Error al cancelar preset: $e");
       throw e;
     }
   }
@@ -273,10 +348,20 @@ class BleService {
     });
   }
   
+  // Métodos para reportar el estado de la calibración
+  void reportCalibrationSuccess(int newPpl) {
+    _calibrationStatusController.add({'status': 'success', 'new_ppl': newPpl});
+  }
+
+  void reportCalibrationFailure(String error) {
+    _calibrationStatusController.add({'status': 'failure', 'error': error});
+  }
+
   // Método para limpiar recursos cuando se destruye el servicio
   void dispose() {
     disconnect();
     _connectionStatusController.close();
     _dataStreamController.close();
+    _calibrationStatusController.close();
   }
 }

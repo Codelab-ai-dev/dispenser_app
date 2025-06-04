@@ -6,4 +6,5 @@ abstract class RfidRepository {
   Future<void> deleteTag(String id);
   Future<void> updateTag(RfidTag tag);
   Future<bool> isTagValid(String hexCode);
+  Future<RfidTag?> getFullTagByPartialId(String partialHexCode);
 }
